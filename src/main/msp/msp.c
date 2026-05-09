@@ -56,6 +56,7 @@
 #include "drivers/camera_control.h"
 #include "drivers/compass/compass.h"
 #include "drivers/display.h"
+#include "drivers/dma_reqmap.h"
 #include "drivers/dshot.h"
 #include "drivers/dshot_command.h"
 #include "drivers/flash/flash.h"
@@ -67,6 +68,7 @@
 #include "drivers/serial.h"
 #include "drivers/serial_escserial.h"
 #include "drivers/system.h"
+#include "drivers/timer.h"
 #include "drivers/transponder_ir.h"
 #include "drivers/usb_msc.h"
 #include "drivers/vtx_common.h"
@@ -461,6 +463,65 @@ static void writeReadEeprom(dispatchEntry_t* self)
 dispatchEntry_t writeReadEepromEntry = {
     writeReadEeprom, 0, NULL, false
 };
+
+// Serialize timer / DMA metadata for a single motor or servo resource ioTag
+// as a 3-byte block. Layout:
+//
+//   byte 0 : timer    - TIM number 1..14 (0 = none / no timer assigned)
+//   byte 1 : channel  - low nibble: CH 1..4 (0 = none)
+//                       high bit  : 0x80 set when channel is the
+//                                   complementary (N) output
+//   byte 2 : dmaCode  - high nibble: DMA controller 1..2 (0 = none)
+//                       low  nibble: stream/channel 0..7 (0 when no DMA)
+//
+// Used by MSP2_MOTOR_SERVO_RESOURCE so the configurator can warn about
+// servo/motor timer conflicts and bidir-DSHOT bit-bang fallback without
+// a separate `timer show` / `dma show` round-trip.
+static void serializeIoTagTimerDma(sbuf_t *dst, ioTag_t ioTag)
+{
+    uint8_t timerNumber = 0;
+    uint8_t channelByte = 0;
+    uint8_t dmaCode = 0;
+
+#if defined(USE_TIMER_MGMT)
+    if (ioTag) {
+        const timerHardware_t *timer = timerGetConfiguredByTag(ioTag);
+        if (timer) {
+            const int8_t tn = timerGetTIMNumber(timer);
+            if (tn > 0) {
+                timerNumber = (uint8_t)tn;
+                channelByte = (CC_INDEX_FROM_CHANNEL(timer->channel) + 1) & 0x0F;
+                if (timer->output & TIMER_OUTPUT_N_CHANNEL) {
+                    channelByte |= 0x80;
+                }
+            }
+
+            // Prefer the explicitly-configured DMA option; fall back to
+            // the firmware's default option for the (timer, channel) so
+            // motors using default DMA aren't reported as DMA-less.
+            const dmaoptValue_t opt = dmaoptByTag(ioTag);
+            const dmaChannelSpec_t *dmaSpec = NULL;
+            if (opt != DMA_OPT_UNUSED) {
+                dmaSpec = dmaGetChannelSpecByTimerValue(timer->tim, timer->channel, opt);
+            }
+            if (!dmaSpec) {
+                dmaSpec = dmaGetChannelSpecByTimer(timer);
+            }
+            if (dmaSpec) {
+                const uint8_t controller = DMA_CODE_CONTROLLER(dmaSpec->code) & 0x0F;
+                const uint8_t stream = DMA_CODE_STREAM(dmaSpec->code) & 0x0F;
+                dmaCode = (controller << 4) | stream;
+            }
+        }
+    }
+#else
+    (void)ioTag;
+#endif
+
+    sbufWriteU8(dst, timerNumber);
+    sbufWriteU8(dst, channelByte);
+    sbufWriteU8(dst, dmaCode);
+}
 
 static void serializeSDCardSummaryReply(sbuf_t *dst)
 {
@@ -1331,8 +1392,21 @@ case MSP_NAME:
 
     case MSP2_MOTOR_SERVO_RESOURCE:
         {
-            // Return motor and servo pin assignments
-            // Format: [motorCount][servoCount][motor0_ioTag]...[motorN_ioTag][servo0_ioTag]...[servoN_ioTag]
+            // Return motor and servo pin assignments along with optional
+            // timer and DMA metadata so the configurator can render
+            // pad-aware dropdowns and timer-conflict warnings without
+            // separate `timer show` / `dma show` CLI round-trips.
+            //
+            // Format:
+            //   [motorCount][servoCount]
+            //   [motor0_ioTag]...[motorN_ioTag]
+            //   [servo0_ioTag]...[servoN_ioTag]
+            //   [motor0_timer][motor0_channel][motor0_dmaCode]...
+            //   [servo0_timer][servo0_channel][servo0_dmaCode]...
+            //
+            // Older configurators stop reading after the ioTag block;
+            // the trailing per-resource metadata block is opt-in by
+            // length so backwards compatibility is preserved.
             STATIC_ASSERT(sizeof(ioTag_t) == sizeof(uint8_t), ioTag_size_must_be_one_byte);
             sbufWriteU8(dst, MAX_SUPPORTED_MOTORS);
 #ifdef USE_SERVOS
@@ -1340,14 +1414,20 @@ case MSP_NAME:
 #else
             sbufWriteU8(dst, 0);
 #endif
-            // Motor ioTags (1 byte each)
             for (unsigned i = 0; i < MAX_SUPPORTED_MOTORS; i++) {
                 sbufWriteU8(dst, motorConfig()->dev.ioTags[i]);
             }
 #ifdef USE_SERVOS
-            // Servo ioTags (1 byte each)
             for (unsigned i = 0; i < MAX_SUPPORTED_SERVOS; i++) {
                 sbufWriteU8(dst, servoConfig()->dev.ioTags[i]);
+            }
+#endif
+            for (unsigned i = 0; i < MAX_SUPPORTED_MOTORS; i++) {
+                serializeIoTagTimerDma(dst, motorConfig()->dev.ioTags[i]);
+            }
+#ifdef USE_SERVOS
+            for (unsigned i = 0; i < MAX_SUPPORTED_SERVOS; i++) {
+                serializeIoTagTimerDma(dst, servoConfig()->dev.ioTags[i]);
             }
 #endif
         }
